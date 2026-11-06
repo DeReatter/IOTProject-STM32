@@ -1,0 +1,15 @@
+../Core/Src/main.c:79:7:hitung_v_baterai	1
+../Core/Src/main.c:84:7:hitung_pres_baterai	3
+../Core/Src/main.c:92:6:TIM2_Init	1
+../Core/Src/main.c:100:6:delay_us	2
+../Core/Src/main.c:107:13:DHT_SetPin_Output	1
+../Core/Src/main.c:115:13:DHT_SetPin_Input	1
+../Core/Src/main.c:134:9:DHT22_Read_Data	22
+../Core/Src/main.c:242:5:main	2
+../Core/Src/main.c:309:6:SystemClock_Config	4
+../Core/Src/main.c:352:13:MX_ADC1_Init	4
+../Core/Src/main.c:405:13:MX_I2C1_Init	2
+../Core/Src/main.c:437:13:MX_USART1_UART_Init	2
+../Core/Src/main.c:466:13:MX_DMA_Init	1
+../Core/Src/main.c:483:13:MX_GPIO_Init	1
+../Core/Src/main.c:527:6:Error_Handler	1
