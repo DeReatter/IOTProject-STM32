@@ -57,14 +57,20 @@ void Error_Handler(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
+#define V_DIVIDER_Pin GPIO_PIN_0
+#define V_DIVIDER_GPIO_Port GPIOA
 #define MQ2_Pin GPIO_PIN_1
 #define MQ2_GPIO_Port GPIOA
-#define buzzer_Pin GPIO_PIN_0
-#define buzzer_GPIO_Port GPIOB
+#define BUZZER_Pin GPIO_PIN_0
+#define BUZZER_GPIO_Port GPIOB
 #define INA_SCL_Pin GPIO_PIN_6
 #define INA_SCL_GPIO_Port GPIOB
 #define INA_SDA_Pin GPIO_PIN_7
 #define INA_SDA_GPIO_Port GPIOB
+#define DHT22_Pin GPIO_PIN_8
+#define DHT22_GPIO_Port GPIOB
+#define IN_RELAY_Pin GPIO_PIN_9
+#define IN_RELAY_GPIO_Port GPIOB
 
 /* USER CODE BEGIN Private defines */
 

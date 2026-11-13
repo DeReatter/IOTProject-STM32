@@ -22,6 +22,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
+#include <string.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -45,18 +46,29 @@ DMA_HandleTypeDef hdma_adc1;
 
 I2C_HandleTypeDef hi2c1;
 
+TIM_HandleTypeDef htim2;
+
 UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
 uint16_t adc_buffer[2];
 
-float v_baterai = 0.0f;
-float pres_baterai = 0.0f;
-uint16_t mq2_raw = 0;
+float v_bat = 0.0f;
+float pres_bat = 0.0f;
+float v_pv = 0.0f;
+float i_pv = 0.0f;
+float p_pv = 0.0f;
+uint8_t ina_status = 0;
 
+uint16_t mq2_raw = 0;
 float suhu = 0.0f;
 float kelembapan = 0.0f;
 uint8_t dht_status = 0;
+
+uint8_t pump_status = 0;
+uint8_t uart_rx_byte = 0;
+char uart_rx_line[32];
+uint8_t uart_rx_idx = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -66,6 +78,7 @@ static void MX_DMA_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_USART1_UART_Init(void);
+static void MX_TIM2_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -73,165 +86,156 @@ static void MX_USART1_UART_Init(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 #define DIVIDER_RATIO 5.54545f
-#define DHT_PORT GPIOA
-#define DHT_PIN  GPIO_PIN_4
+#define INA219_ADDR				(0x40 << 1)
+#define INA219_REG_CONFIG   	0x00
+#define INA219_REG_SHUNTVOLT 	0x01
+#define INA219_REG_BUSVOLT  	0x02
 
-float hitung_v_baterai(uint16_t raw_adc) {
+float hitung_v_bat(uint16_t raw_adc) {
 	float v_pin = ((float) raw_adc / 4095.0f) * 3.3f;
 	return v_pin * DIVIDER_RATIO;
 }
-
-float hitung_pres_baterai(float volt) {
+float hitung_pres_bat(float volt) {
 	if (volt >= 14.4f)
 		return 100.0f;
 	if (volt <= 10.0f)
 		return 0.0f;
 	return ((volt - 10.0f) / (14.4f - 10.0f)) * 100.0f;
 }
-
-void TIM2_Init(void) {
-	__HAL_RCC_TIM2_CLK_ENABLE();
-	TIM2->PSC = 72 - 1; // 72 MHz / 72 = 1 MHz -> 1 tick = 1 microsecond
-	TIM2->ARR = 0xFFFF;
-	TIM2->CNT = 0;
-	TIM2->CR1 |= TIM_CR1_CEN;
-}
-
 void delay_us(uint16_t us) {
-	uint16_t start = TIM2->CNT;
-	while ((uint16_t)(TIM2->CNT - start) < us)
+	uint16_t start = (uint16_t) htim2.Instance->CNT;
+	while ((uint16_t) (htim2.Instance->CNT - start) < us)
 		;
 }
-
-// Konfigurasi pin dinamis untuk jalur Data DHT22 (PA4)
 static void DHT_SetPin_Output(void) {
 	GPIO_InitTypeDef GPIO_InitStruct = { 0 };
-	GPIO_InitStruct.Pin = DHT_PIN;
+	GPIO_InitStruct.Pin = DHT22_Pin;
 	GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
 	GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
-	HAL_GPIO_Init(DHT_PORT, &GPIO_InitStruct);
+	HAL_GPIO_Init(DHT22_GPIO_Port, &GPIO_InitStruct);
 }
-
 static void DHT_SetPin_Input(void) {
 	GPIO_InitTypeDef GPIO_InitStruct = { 0 };
-	GPIO_InitStruct.Pin = DHT_PIN;
+	GPIO_InitStruct.Pin = DHT22_Pin;
 	GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
 	GPIO_InitStruct.Pull = GPIO_PULLUP;
-	HAL_GPIO_Init(DHT_PORT, &GPIO_InitStruct);
+	HAL_GPIO_Init(DHT22_GPIO_Port, &GPIO_InitStruct);
 }
-
-/**
- * @brief Membaca data DHT22 (atau DHT11) dengan error code diagnostik lengkap
- * @return 1: SUKSES
- *         2: ERROR - Sensor tidak menarik LOW (tidak merespons sinyal START)
- *         3: ERROR - Sensor tertahan di LOW setelah respon awal
- *         4: ERROR - Sensor tertahan di HIGH setelah respon awal
- *         5: ERROR - Timeout pulsa bit LOW
- *         6: ERROR - Timeout pulsa bit HIGH
- *         7: ERROR - Seluruh data bernilai 0 (sinyal kosong)
- *         8: ERROR - Checksum tidak valid (data korup)
- */
-uint8_t DHT22_Read_Data(float *suhu, float *kelembaban) {
+//static void DHT_Init_OpenDrain(void) {
+//	GPIO_InitTypeDef GPIO_InitStruct = { 0 };
+//	GPIO_InitStruct.Pin = DHT_PIN;
+//	GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
+//	GPIO_InitStruct.Pull = GPIO_PULLUP;
+//	GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+//	HAL_GPIO_Init(DHT_PORT, &GPIO_InitStruct);
+//	HAL_GPIO_WritePin(DHT_PORT, DHT_PIN, GPIO_PIN_SET);
+//}
+uint8_t DHT22_Read_Data(float *suhu_out, float *kelembapan_out) {
 	uint8_t bits[5] = { 0, 0, 0, 0, 0 };
 	uint16_t t0;
 
-	// 1. Kirim START signal: Tarik LOW selama 18 ms (standar universal untuk DHT22/AM2302 & DHT11)
 	DHT_SetPin_Output();
-	HAL_GPIO_WritePin(DHT_PORT, DHT_PIN, GPIO_PIN_RESET);
+	HAL_GPIO_WritePin(DHT22_GPIO_Port, DHT22_Pin, GPIO_PIN_RESET);
 	HAL_Delay(18);
 
-	// Tarik HIGH sebentar (30 us) lalu pindah ke Input Pull-up
-	HAL_GPIO_WritePin(DHT_PORT, DHT_PIN, GPIO_PIN_SET);
-	delay_us(30);
+	HAL_GPIO_WritePin(DHT22_GPIO_Port, DHT22_Pin, GPIO_PIN_SET);
+	delay_us(15);
 	DHT_SetPin_Input();
 
-	// Matikan interupsi sesaat agar pulsa mikrodetik tidak terdistorsi
 	__disable_irq();
 
-	// 2. Handshake Step 1: Menunggu sensor menarik garis ke LOW (maks 100 us)
-	t0 = TIM2->CNT;
-	while (DHT_PORT->IDR & DHT_PIN) {
-		if ((uint16_t)(TIM2->CNT - t0) > 100) {
+	t0 = (uint16_t) htim2.Instance->CNT;
+	while (DHT22_GPIO_Port->IDR & DHT22_Pin) {
+		if ((uint16_t) (htim2.Instance->CNT - t0) > 150) {
 			__enable_irq();
-			return 2; // Sensor tidak merespons
+			return 2;
 		}
 	}
-
-	// 3. Handshake Step 2: Menunggu sensor melepas kembali ke HIGH (~80 us LOW)
-	t0 = TIM2->CNT;
-	while (!(DHT_PORT->IDR & DHT_PIN)) {
-		if ((uint16_t)(TIM2->CNT - t0) > 100) {
+	t0 = (uint16_t) htim2.Instance->CNT;
+	while (!(DHT22_GPIO_Port->IDR & DHT22_Pin)) {
+		if ((uint16_t) (htim2.Instance->CNT - t0) > 150) {
 			__enable_irq();
-			return 3; // Sensor tertahan LOW
+			return 3;
 		}
 	}
-
-	// 4. Handshake Step 3: Menunggu sensor menarik ke LOW lagi (~80 us HIGH)
-	t0 = TIM2->CNT;
-	while (DHT_PORT->IDR & DHT_PIN) {
-		if ((uint16_t)(TIM2->CNT - t0) > 100) {
+	t0 = (uint16_t) htim2.Instance->CNT;
+	while (DHT22_GPIO_Port->IDR & DHT22_Pin) {
+		if ((uint16_t) (htim2.Instance->CNT - t0) > 150) {
 			__enable_irq();
-			return 4; // Sensor tertahan HIGH
+			return 4;
 		}
 	}
-
-	// 5. Baca 40 bit data (5 byte)
 	for (int i = 0; i < 40; i++) {
-		// Menunggu pulsa LOW 50 us tiap bit selesai
-		t0 = TIM2->CNT;
-		while (!(DHT_PORT->IDR & DHT_PIN)) {
-			if ((uint16_t)(TIM2->CNT - t0) > 100) {
+		t0 = (uint16_t) htim2.Instance->CNT;
+		while (!(DHT22_GPIO_Port->IDR & DHT22_Pin)) {
+			if ((uint16_t) (htim2.Instance->CNT - t0) > 120) {
 				__enable_irq();
-				return 5; // Timeout bit LOW
+				return 5;
 			}
 		}
-
-		// Ukur durasi pulsa HIGH: 26-28 us = bit '0', 70 us = bit '1'
-		t0 = TIM2->CNT;
-		while (DHT_PORT->IDR & DHT_PIN) {
-			if ((uint16_t)(TIM2->CNT - t0) > 120) {
+		t0 = (uint16_t) htim2.Instance->CNT;
+		while (DHT22_GPIO_Port->IDR & DHT22_Pin) {
+			if ((uint16_t) (htim2.Instance->CNT - t0) > 120) {
 				__enable_irq();
-				return 6; // Timeout bit HIGH
+				return 6;
 			}
 		}
-
-		uint16_t duration = (uint16_t)(TIM2->CNT - t0);
+		uint16_t duration = (uint16_t) (htim2.Instance->CNT - t0);
 		if (duration > 45) {
 			bits[i / 8] |= (1 << (7 - (i % 8)));
 		}
 	}
-
-	// Hidupkan kembali interupsi segera setelah 40 bit selesai dibaca
 	__enable_irq();
 
-	// Cek jika seluruh byte 0 (tidak valid)
-	if (bits[0] == 0 && bits[1] == 0 && bits[2] == 0 && bits[3] == 0 && bits[4] == 0) {
+	if (bits[0] == 0 && bits[1] == 0 && bits[2] == 0 && bits[3] == 0
+			&& bits[4] == 0) {
 		return 7;
 	}
-
-	// Verifikasi Checksum (Byte 4 = Byte 0 + Byte 1 + Byte 2 + Byte 3)
 	if (bits[4] != ((bits[0] + bits[1] + bits[2] + bits[3]) & 0xFF)) {
-		return 8; // Checksum mismatch
+		return 8;
 	}
+	uint16_t raw_rh = ((uint16_t) bits[0] << 8) | bits[1];
+	*kelembapan_out = (float) raw_rh / 10.0f;
+	uint16_t raw_temp = (((uint16_t) bits[2] & 0x7F) << 8) | bits[3];
+	*suhu_out = (float) raw_temp / 10.0f;
+	if (bits[2] & 0x80) {
+		*suhu_out = -(*suhu_out);
+	}
+	return 1;
+}
+uint8_t INA219_Init(void) {
+	if (HAL_I2C_IsDeviceReady(&hi2c1, INA219_ADDR, 2, 50) != HAL_OK) {
+		return 0;
+	}
+	uint8_t config[3] = { INA219_REG_CONFIG, 0x39, 0x9F };
+	if (HAL_I2C_Master_Transmit(&hi2c1, INA219_ADDR, config, 3, 50) == HAL_OK) {
+		return 1;
+	}
+	return 0;
+}
+void INA219_Read_data(float *v_bus, float *i_ma, float *p_watt) {
+	uint8_t buf[2];
+	int16_t raw_shunt = 0;
+	int16_t raw_bus = 0;
 
-	// Decode data (Otomatis membedakan format DHT22 dan DHT11)
-	if (bits[0] > 4) {
-		// Format DHT11 (jika ternyata modul adalah DHT11)
-		*kelembaban = (float) bits[0] + ((float) bits[1] / 10.0f);
-		*suhu = (float) bits[2] + ((float) bits[3] / 10.0f);
+	if (HAL_I2C_Mem_Read(&hi2c1, INA219_ADDR, INA219_REG_SHUNTVOLT,
+	I2C_MEMADD_SIZE_8BIT, buf, 2, 50) == HAL_OK) {
+		raw_shunt = (int16_t) ((buf[0] << 8) | buf[1]);
+		*i_ma = (float) raw_shunt * 0.1f;
+		if (*i_ma < 0.0f)
+			*i_ma = 0.0f;
 	} else {
-		// Format DHT22 / AM2302
-		uint16_t raw_rh = ((uint16_t) bits[0] << 8) | bits[1];
-		*kelembaban = (float) raw_rh / 10.0f;
-
-		uint16_t raw_temp = (((uint16_t) bits[2] & 0x7F) << 8) | bits[3];
-		*suhu = (float) raw_temp / 10.0f;
-		if (bits[2] & 0x80) {
-			*suhu = -(*suhu);
-		}
+		*i_ma = 0.0f;
 	}
 
-	return 1; // Pembacaan SUKSES
+	if (HAL_I2C_Mem_Read(&hi2c1, INA219_ADDR, INA219_REG_BUSVOLT,
+	I2C_MEMADD_SIZE_8BIT, buf, 2, 50) == HAL_OK) {
+		raw_bus = (int16_t) ((buf[0] << 8) | buf[1]);
+		*v_bus = (float) ((raw_bus >> 3) * 4) / 1000.0f;
+	} else {
+		*v_bus = 0.0f;
+	}
+	*p_watt = (*v_bus) * (*i_ma / 1000.0f);
 }
 /* USER CODE END 0 */
 
@@ -267,33 +271,47 @@ int main(void) {
 	MX_ADC1_Init();
 	MX_I2C1_Init();
 	MX_USART1_UART_Init();
+	MX_TIM2_Init();
 	/* USER CODE BEGIN 2 */
-	TIM2_Init();
-	DHT_SetPin_Input();
+	HAL_GPIO_WritePin(IN_RELAY_GPIO_Port, IN_RELAY_Pin, GPIO_PIN_SET);
+	HAL_GPIO_WritePin(BUZZER_GPIO_Port, BUZZER_Pin, GPIO_PIN_RESET);
+	__HAL_TIM_SET_PRESCALER(&htim2, 71);
+	htim2.Instance->EGR = TIM_EGR_UG;
+	HAL_TIM_Base_Start(&htim2);
 	HAL_ADC_Start_DMA(&hadc1, (uint32_t*) adc_buffer, 2);
+	ina_status = INA219_Init();
+	HAL_UART_Receive_IT(&huart1, &uart_rx_byte, 1);
 	HAL_Delay(2000);
 	/* USER CODE END 2 */
 
 	/* Infinite loop */
 	/* USER CODE BEGIN WHILE */
 	while (1) {
-		v_baterai = hitung_v_baterai(adc_buffer[0]);
-		pres_baterai = hitung_pres_baterai(v_baterai);
+		v_bat = hitung_v_bat(adc_buffer[0]);
+		pres_bat = hitung_pres_bat(v_bat);
 		mq2_raw = adc_buffer[1];
+
 		dht_status = DHT22_Read_Data(&suhu, &kelembapan);
 
-		if (mq2_raw > 2000) {
-			HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_SET); //BUZZER ON
+		if (ina_status == 1) {
+			INA219_Read_data(&v_pv, &i_pv, &p_pv);
 		} else {
-			HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_RESET); //BUZZER OFF
+			ina_status = INA219_Init();
 		}
 
-		char uart_tx_buff[100];
-		int len = sprintf(uart_tx_buff, "$DATA,%.2f,%.1f,%u,%.1f,%.1f,%u\n",
-				v_baterai, pres_baterai, mq2_raw, suhu, kelembapan, dht_status);
+		if (mq2_raw > 2000 || suhu > 50.0f) {
+			HAL_GPIO_WritePin(BUZZER_GPIO_Port, BUZZER_Pin, GPIO_PIN_SET);
+		} else {
+			HAL_GPIO_WritePin(BUZZER_GPIO_Port, BUZZER_Pin, GPIO_PIN_RESET);
+		}
+
+		char uart_tx_buff[140];
+		int len = sprintf(uart_tx_buff,
+				"$DATA,%.2f,%.1f,%u,%.1f,%.1f,%u,%.2f,%.1f,%.2f,%u,%u\n", v_bat,
+				pres_bat, mq2_raw, suhu, kelembapan, dht_status, v_pv, i_pv,
+				p_pv, ina_status, pump_status);
 
 		HAL_UART_Transmit(&huart1, (uint8_t*) uart_tx_buff, len, 100);
-
 		HAL_Delay(2000);
 		/* USER CODE END WHILE */
 
@@ -430,6 +448,48 @@ static void MX_I2C1_Init(void) {
 }
 
 /**
+ * @brief TIM2 Initialization Function
+ * @param None
+ * @retval None
+ */
+static void MX_TIM2_Init(void) {
+
+	/* USER CODE BEGIN TIM2_Init 0 */
+
+	/* USER CODE END TIM2_Init 0 */
+
+	TIM_ClockConfigTypeDef sClockSourceConfig = { 0 };
+	TIM_MasterConfigTypeDef sMasterConfig = { 0 };
+
+	/* USER CODE BEGIN TIM2_Init 1 */
+
+	/* USER CODE END TIM2_Init 1 */
+	htim2.Instance = TIM2;
+	htim2.Init.Prescaler = 72 - 1;
+	htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+	htim2.Init.Period = 65535;
+	htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+	htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+	if (HAL_TIM_Base_Init(&htim2) != HAL_OK) {
+		Error_Handler();
+	}
+	sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+	if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK) {
+		Error_Handler();
+	}
+	sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+	sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+	if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig)
+			!= HAL_OK) {
+		Error_Handler();
+	}
+	/* USER CODE BEGIN TIM2_Init 2 */
+
+	/* USER CODE END TIM2_Init 2 */
+
+}
+
+/**
  * @brief USART1 Initialization Function
  * @param None
  * @retval None
@@ -492,24 +552,24 @@ static void MX_GPIO_Init(void) {
 	__HAL_RCC_GPIOB_CLK_ENABLE();
 
 	/*Configure GPIO pin Output Level */
-	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_RESET);
+	HAL_GPIO_WritePin(BUZZER_GPIO_Port, BUZZER_Pin, GPIO_PIN_RESET);
 
 	/*Configure GPIO pin Output Level */
-	HAL_GPIO_WritePin(buzzer_GPIO_Port, buzzer_Pin, GPIO_PIN_RESET);
+	HAL_GPIO_WritePin(GPIOB, DHT22_Pin | IN_RELAY_Pin, GPIO_PIN_SET);
 
-	/*Configure GPIO pin : PA4 */
-	GPIO_InitStruct.Pin = GPIO_PIN_4;
-	GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
-	GPIO_InitStruct.Pull = GPIO_PULLUP;
-	GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-	HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-
-	/*Configure GPIO pin : buzzer_Pin */
-	GPIO_InitStruct.Pin = buzzer_Pin;
+	/*Configure GPIO pins : BUZZER_Pin IN_RELAY_Pin */
+	GPIO_InitStruct.Pin = BUZZER_Pin | IN_RELAY_Pin;
 	GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
 	GPIO_InitStruct.Pull = GPIO_NOPULL;
 	GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-	HAL_GPIO_Init(buzzer_GPIO_Port, &GPIO_InitStruct);
+	HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+	/*Configure GPIO pin : DHT22_Pin */
+	GPIO_InitStruct.Pin = DHT22_Pin;
+	GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
+	GPIO_InitStruct.Pull = GPIO_PULLUP;
+	GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+	HAL_GPIO_Init(DHT22_GPIO_Port, &GPIO_InitStruct);
 
 	/* USER CODE BEGIN MX_GPIO_Init_2 */
 
@@ -517,7 +577,29 @@ static void MX_GPIO_Init(void) {
 }
 
 /* USER CODE BEGIN 4 */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
+	if (huart->Instance == USART1) {
+		if (uart_rx_byte == '\n' || uart_rx_byte == '\r') {
+			if (uart_rx_idx > 0) {
+				uart_rx_line[uart_rx_idx] = '\0';
 
+				if (strcmp(uart_rx_line, "$CMD,PUMP,1") == 0) {
+					pump_status = 1;
+					HAL_GPIO_WritePin(IN_RELAY_GPIO_Port, IN_RELAY_Pin,
+							GPIO_PIN_RESET);
+				} else if (strcmp(uart_rx_line, "$CMD,PUMP,0") == 0) {
+					pump_status = 0;
+					HAL_GPIO_WritePin(IN_RELAY_GPIO_Port, IN_RELAY_Pin,
+							GPIO_PIN_SET);
+				}
+				uart_rx_idx = 0;
+			}
+		} else if (uart_rx_idx < sizeof(uart_rx_line) - 1) {
+			uart_rx_line[uart_rx_idx++] = (char) uart_rx_byte;
+		}
+		HAL_UART_Receive_IT(huart, &uart_rx_byte, 1);
+	}
+}
 /* USER CODE END 4 */
 
 /**
