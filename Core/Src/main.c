@@ -32,7 +32,9 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+// Konfigurasi Buzzer Active-LOW (Sesuai implementasi cek-buzz: ON = RESET / 0V, OFF = SET / 3.3V)
+#define BUZZER_STATE_ON   GPIO_PIN_RESET
+#define BUZZER_STATE_OFF  GPIO_PIN_SET
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -66,6 +68,7 @@ float kelembapan = 0.0f;
 uint8_t dht_status = 0;
 
 uint8_t pump_status = 0;
+uint8_t buzzer_manual = 0;
 uint8_t uart_rx_byte = 0;
 char uart_rx_line[32];
 uint8_t uart_rx_idx = 0;
@@ -80,7 +83,9 @@ static void MX_I2C1_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_TIM2_Init(void);
 /* USER CODE BEGIN PFP */
-
+void Buzzer_On(void);
+void Buzzer_Off(void);
+void Buzzer_Beep(uint8_t jumlah, uint16_t on_ms, uint16_t off_ms);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -90,6 +95,25 @@ static void MX_TIM2_Init(void);
 #define INA219_REG_CONFIG   	0x00
 #define INA219_REG_SHUNTVOLT 	0x01
 #define INA219_REG_BUSVOLT  	0x02
+
+void Buzzer_On(void) {
+	HAL_GPIO_WritePin(BUZZER_GPIO_Port, BUZZER_Pin, BUZZER_STATE_ON);
+}
+
+void Buzzer_Off(void) {
+	HAL_GPIO_WritePin(BUZZER_GPIO_Port, BUZZER_Pin, BUZZER_STATE_OFF);
+}
+
+void Buzzer_Beep(uint8_t jumlah, uint16_t on_ms, uint16_t off_ms) {
+	for (uint8_t i = 0; i < jumlah; i++) {
+		Buzzer_On();
+		HAL_Delay(on_ms);
+		Buzzer_Off();
+		if (i < (jumlah - 1)) {
+			HAL_Delay(off_ms);
+		}
+	}
+}
 
 float hitung_v_bat(uint16_t raw_adc) {
 	float v_pin = ((float) raw_adc / 4095.0f) * 3.3f;
@@ -274,7 +298,11 @@ int main(void) {
 	MX_TIM2_Init();
 	/* USER CODE BEGIN 2 */
 	HAL_GPIO_WritePin(IN_RELAY_GPIO_Port, IN_RELAY_Pin, GPIO_PIN_SET);
-	HAL_GPIO_WritePin(BUZZER_GPIO_Port, BUZZER_Pin, GPIO_PIN_RESET);
+	// Inisialisasi buzzer dalam keadaan MATI (Active-LOW: SET = OFF)
+	Buzzer_Off();
+	// Indikasi sistem startup siap (beep 1x pendek 100ms)
+	Buzzer_Beep(1, 100, 100);
+
 	__HAL_TIM_SET_PRESCALER(&htim2, 71);
 	htim2.Instance->EGR = TIM_EGR_UG;
 	HAL_TIM_Base_Start(&htim2);
@@ -293,16 +321,35 @@ int main(void) {
 
 		dht_status = DHT22_Read_Data(&suhu, &kelembapan);
 
+		// Proteksi: jika data DHT22 gagal dibaca, reset suhu & kelembapan ke 0 agar tidak memicu alarm palsu
+		if (dht_status != 1) {
+			suhu = 0.0f;
+			kelembapan = 0.0f;
+		}
+
 		if (ina_status == 1) {
 			INA219_Read_data(&v_pv, &i_pv, &p_pv);
 		} else {
 			ina_status = INA219_Init();
 		}
 
-		if (mq2_raw > 2000 || suhu > 50.0f) {
-			HAL_GPIO_WritePin(BUZZER_GPIO_Port, BUZZER_Pin, GPIO_PIN_SET);
+		// Evaluasi kondisi alarm:
+		// 1. Gas MQ-2 pekat (> 2000)
+		// 2. Suhu tinggi (> 50°C), HANYA jika data DHT22 valid (dht_status == 1)
+		// 3. Perintah manual dari UART ($CMD,BUZZER,1)
+		uint8_t status_alarm = 0;
+		if (buzzer_manual == 1 || mq2_raw > 2000 || (dht_status == 1 && suhu > 50.0f)) {
+			status_alarm = 1;
+		}
+
+		// Pola kendali buzzer Active-LOW sesuai implementasi cek-buzz:
+		if (status_alarm == 1) {
+			// Bunyi pulsa peringatan: ON 200ms (RESET), lalu OFF (SET)
+			Buzzer_On();
+			HAL_Delay(200);
+			Buzzer_Off();
 		} else {
-			HAL_GPIO_WritePin(BUZZER_GPIO_Port, BUZZER_Pin, GPIO_PIN_RESET);
+			Buzzer_Off();
 		}
 
 		char uart_tx_buff[140];
@@ -312,7 +359,13 @@ int main(void) {
 				p_pv, ina_status, pump_status);
 
 		HAL_UART_Transmit(&huart1, (uint8_t*) uart_tx_buff, len, 100);
-		HAL_Delay(2000);
+
+		// Kompensasi delay total siklus 2 detik (2000 ms)
+		if (status_alarm == 1) {
+			HAL_Delay(1800);
+		} else {
+			HAL_Delay(2000);
+		}
 		/* USER CODE END WHILE */
 
 		/* USER CODE BEGIN 3 */
@@ -572,7 +625,8 @@ static void MX_GPIO_Init(void) {
 	HAL_GPIO_Init(DHT22_GPIO_Port, &GPIO_InitStruct);
 
 	/* USER CODE BEGIN MX_GPIO_Init_2 */
-
+	// Memastikan pin buzzer dalam kondisi MATI (SET / 3.3V) segera setelah GPIO diinisialisasi
+	HAL_GPIO_WritePin(BUZZER_GPIO_Port, BUZZER_Pin, BUZZER_STATE_OFF);
 	/* USER CODE END MX_GPIO_Init_2 */
 }
 
@@ -591,6 +645,12 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
 					pump_status = 0;
 					HAL_GPIO_WritePin(IN_RELAY_GPIO_Port, IN_RELAY_Pin,
 							GPIO_PIN_SET);
+				} else if (strcmp(uart_rx_line, "$CMD,BUZZER,1") == 0) {
+					buzzer_manual = 1;
+					Buzzer_On();
+				} else if (strcmp(uart_rx_line, "$CMD,BUZZER,0") == 0) {
+					buzzer_manual = 0;
+					Buzzer_Off();
 				}
 				uart_rx_idx = 0;
 			}
