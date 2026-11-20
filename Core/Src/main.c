@@ -33,8 +33,17 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 // Konfigurasi Buzzer Active-LOW (Sesuai implementasi cek-buzz: ON = RESET / 0V, OFF = SET / 3.3V)
-#define BUZZER_STATE_ON   GPIO_PIN_RESET
-#define BUZZER_STATE_OFF  GPIO_PIN_SET
+#define BUZZER_STATE_ON       GPIO_PIN_RESET
+#define BUZZER_STATE_OFF      GPIO_PIN_SET
+
+// Konfigurasi Relay Active-LOW (ON = RESET / 0V, OFF = SET / 3.3V)
+#define RELAY_STATE_ON        GPIO_PIN_RESET
+#define RELAY_STATE_OFF       GPIO_PIN_SET
+
+// Parameter Ambang Batas Sensor (Thresholds)
+#define MQ2_THRESHOLD_ROKOK   1000      // Nilai batas asap rokok (1000 - 2000 ADC)
+#define MQ2_THRESHOLD_FIRE    2000      // Nilai batas kebakaran gas/asap pekat (> 2000 ADC)
+#define SUHU_THRESHOLD_FIRE   50.0f     // Nilai batas suhu kebakaran (> 50.0 °C)
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -67,8 +76,12 @@ float suhu = 0.0f;
 float kelembapan = 0.0f;
 uint8_t dht_status = 0;
 
-uint8_t pump_status = 0;
-uint8_t buzzer_manual = 0;
+// Variabel status & kontrol (volatile agar dapat dimonitor/diedit langsung via Live Expressions)
+volatile uint8_t pump_status = 0;
+volatile uint8_t buzzer_manual = 0;
+volatile uint8_t deteksi_kebakaran = 0;
+volatile uint8_t deteksi_rokok = 0;
+
 uint8_t uart_rx_byte = 0;
 char uart_rx_line[32];
 uint8_t uart_rx_idx = 0;
@@ -109,9 +122,7 @@ void Buzzer_Beep(uint8_t jumlah, uint16_t on_ms, uint16_t off_ms) {
 		Buzzer_On();
 		HAL_Delay(on_ms);
 		Buzzer_Off();
-		if (i < (jumlah - 1)) {
-			HAL_Delay(off_ms);
-		}
+		HAL_Delay(off_ms);
 	}
 }
 
@@ -297,7 +308,7 @@ int main(void) {
 	MX_USART1_UART_Init();
 	MX_TIM2_Init();
 	/* USER CODE BEGIN 2 */
-	HAL_GPIO_WritePin(IN_RELAY_GPIO_Port, IN_RELAY_Pin, GPIO_PIN_SET);
+	HAL_GPIO_WritePin(IN_RELAY_GPIO_Port, IN_RELAY_Pin, RELAY_STATE_OFF);
 	// Inisialisasi buzzer dalam keadaan MATI (Active-LOW: SET = OFF)
 	Buzzer_Off();
 	// Indikasi sistem startup siap (beep 1x pendek 100ms)
@@ -315,6 +326,14 @@ int main(void) {
 	/* Infinite loop */
 	/* USER CODE BEGIN WHILE */
 	while (1) {
+		// 0. Sinkronisasi status Relay Pompa ke pin hardware (Active-LOW: RESET = ON, SET = OFF)
+		// Memungkinkan pengujian relay langsung lewat Live Expressions di STM32CubeIDE (variabel: pump_status)
+		if (pump_status == 1) {
+			HAL_GPIO_WritePin(IN_RELAY_GPIO_Port, IN_RELAY_Pin, RELAY_STATE_ON);
+		} else {
+			HAL_GPIO_WritePin(IN_RELAY_GPIO_Port, IN_RELAY_Pin, RELAY_STATE_OFF);
+		}
+
 		v_bat = hitung_v_bat(adc_buffer[0]);
 		pres_bat = hitung_pres_bat(v_bat);
 		mq2_raw = adc_buffer[1];
@@ -333,25 +352,38 @@ int main(void) {
 			ina_status = INA219_Init();
 		}
 
-		// Evaluasi kondisi alarm:
-		// 1. Gas MQ-2 pekat (> 2000)
-		// 2. Suhu tinggi (> 50°C), HANYA jika data DHT22 valid (dht_status == 1)
-		// 3. Perintah manual dari UART ($CMD,BUZZER,1)
-		uint8_t status_alarm = 0;
-		if (buzzer_manual == 1 || mq2_raw > 2000 || (dht_status == 1 && suhu > 50.0f)) {
-			status_alarm = 1;
+		// Evaluasi kondisi deteksi:
+		// 1. Kebakaran : Gas MQ-2 pekat (> 2000) ATAU suhu tinggi (> 50°C saat DHT22 valid)
+		// 2. Asap Rokok: Gas MQ-2 dalam rentang asap rokok (1000 - 2000 ADC) dan suhu normal
+		if (mq2_raw > MQ2_THRESHOLD_FIRE || (dht_status == 1 && suhu > SUHU_THRESHOLD_FIRE)) {
+			deteksi_kebakaran = 1;
+			deteksi_rokok = 0;
+		} else if (mq2_raw >= MQ2_THRESHOLD_ROKOK) {
+			deteksi_kebakaran = 0;
+			deteksi_rokok = 1;
+		} else {
+			deteksi_kebakaran = 0;
+			deteksi_rokok = 0;
 		}
 
-		// Pola kendali buzzer Active-LOW sesuai implementasi cek-buzz:
-		if (status_alarm == 1) {
-			// Bunyi pulsa peringatan: ON 200ms (RESET), lalu OFF (SET)
+		// Pola kendali Buzzer (Active-LOW: ON = RESET, OFF = SET):
+		// - Kebakaran / Manual: Buzzer MENYALA TERUS hingga aman
+		// - Asap Rokok        : Buzzer BIP BERULANG SELAMA 1 DETIK (5x beep @ 100ms ON / 100ms OFF)
+		// - Aman              : Buzzer MATI
+		uint16_t delay_sisa_ms = 2000;
+		if (buzzer_manual == 1 || deteksi_kebakaran == 1) {
 			Buzzer_On();
-			HAL_Delay(200);
+			delay_sisa_ms = 2000; // Buzzer tetap menyala terus selama delay dan iterasi berikutnya
+		} else if (deteksi_rokok == 1) {
+			Buzzer_Beep(5, 100, 100); // 5 x 200ms = 1000 ms (1 detik bip berulang)
 			Buzzer_Off();
+			delay_sisa_ms = 1000;     // Kompensasi delay 1 detik agar total siklus tetap 2 detik
 		} else {
 			Buzzer_Off();
+			delay_sisa_ms = 2000;
 		}
 
+		// Format pesan serial UART ke ESP32 (TIDAK BERUBAH / TETAP PERSIS)
 		char uart_tx_buff[140];
 		int len = sprintf(uart_tx_buff,
 				"$DATA,%.2f,%.1f,%u,%.1f,%.1f,%u,%.2f,%.1f,%.2f,%u,%u\n", v_bat,
@@ -360,12 +392,7 @@ int main(void) {
 
 		HAL_UART_Transmit(&huart1, (uint8_t*) uart_tx_buff, len, 100);
 
-		// Kompensasi delay total siklus 2 detik (2000 ms)
-		if (status_alarm == 1) {
-			HAL_Delay(1800);
-		} else {
-			HAL_Delay(2000);
-		}
+		HAL_Delay(delay_sisa_ms);
 		/* USER CODE END WHILE */
 
 		/* USER CODE BEGIN 3 */
@@ -640,11 +667,11 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
 				if (strcmp(uart_rx_line, "$CMD,PUMP,1") == 0) {
 					pump_status = 1;
 					HAL_GPIO_WritePin(IN_RELAY_GPIO_Port, IN_RELAY_Pin,
-							GPIO_PIN_RESET);
+							RELAY_STATE_ON);
 				} else if (strcmp(uart_rx_line, "$CMD,PUMP,0") == 0) {
 					pump_status = 0;
 					HAL_GPIO_WritePin(IN_RELAY_GPIO_Port, IN_RELAY_Pin,
-							GPIO_PIN_SET);
+							RELAY_STATE_OFF);
 				} else if (strcmp(uart_rx_line, "$CMD,BUZZER,1") == 0) {
 					buzzer_manual = 1;
 					Buzzer_On();
