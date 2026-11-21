@@ -41,8 +41,8 @@
 #define RELAY_STATE_OFF       GPIO_PIN_SET
 
 // Parameter Ambang Batas Sensor (Thresholds)
-#define MQ2_THRESHOLD_ROKOK   1000      // Nilai batas asap rokok (1000 - 2000 ADC)
-#define MQ2_THRESHOLD_FIRE    2000      // Nilai batas kebakaran gas/asap pekat (> 2000 ADC)
+#define MQ2_THRESHOLD_ROKOK   700      // Nilai batas asap rokok (1000 - 2000 ADC)
+#define MQ2_THRESHOLD_FIRE    1500      // Nilai batas kebakaran gas/asap pekat (> 2000 ADC)
 #define SUHU_THRESHOLD_FIRE   50.0f     // Nilai batas suhu kebakaran (> 50.0 °C)
 /* USER CODE END PD */
 
@@ -103,7 +103,7 @@ void Buzzer_Beep(uint8_t jumlah, uint16_t on_ms, uint16_t off_ms);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-#define DIVIDER_RATIO 5.54545f
+//#define DIVIDER_RATIO 5.54545f
 #define INA219_ADDR				(0x40 << 1)
 #define INA219_REG_CONFIG   	0x00
 #define INA219_REG_SHUNTVOLT 	0x01
@@ -128,14 +128,15 @@ void Buzzer_Beep(uint8_t jumlah, uint16_t on_ms, uint16_t off_ms) {
 
 float hitung_v_bat(uint16_t raw_adc) {
 	float v_pin = ((float) raw_adc / 4095.0f) * 3.3f;
-	return v_pin * DIVIDER_RATIO;
+	return v_pin;
+//	return v_pin * DIVIDER_RATIO;
 }
 float hitung_pres_bat(float volt) {
-	if (volt >= 14.4f)
+	if (volt >= 12.6f)
 		return 100.0f;
-	if (volt <= 10.0f)
+	if (volt <= 11.1f)
 		return 0.0f;
-	return ((volt - 10.0f) / (14.4f - 10.0f)) * 100.0f;
+	return ((volt - 11.1f) / (12.6f - 11.1f)) * 100.0f;
 }
 void delay_us(uint16_t us) {
 	uint16_t start = (uint16_t) htim2.Instance->CNT;
@@ -248,29 +249,36 @@ uint8_t INA219_Init(void) {
 	}
 	return 0;
 }
-void INA219_Read_data(float *v_bus, float *i_ma, float *p_watt) {
+// Ubah return type menjadi uint8_t agar status koneksi I2C terpantau real-time
+uint8_t INA219_Read_data(float *v_bus, float *i_ma, float *p_watt) {
 	uint8_t buf[2];
 	int16_t raw_shunt = 0;
-	int16_t raw_bus = 0;
+	uint16_t raw_bus = 0;
 
 	if (HAL_I2C_Mem_Read(&hi2c1, INA219_ADDR, INA219_REG_SHUNTVOLT,
-	I2C_MEMADD_SIZE_8BIT, buf, 2, 50) == HAL_OK) {
-		raw_shunt = (int16_t) ((buf[0] << 8) | buf[1]);
-		*i_ma = (float) raw_shunt * 0.1f;
-		if (*i_ma < 0.0f)
-			*i_ma = 0.0f;
-	} else {
+	I2C_MEMADD_SIZE_8BIT, buf, 2, 50) != HAL_OK) {
+		*i_ma = 0.0f;
+		*v_bus = 0.0f;
+		*p_watt = 0.0f;
+		return 0;
+	}
+	raw_shunt = (int16_t) ((buf[0] << 8) | buf[1]);
+	*i_ma = (float) raw_shunt * 0.1f;
+	if (*i_ma < 0.0f) {
 		*i_ma = 0.0f;
 	}
 
 	if (HAL_I2C_Mem_Read(&hi2c1, INA219_ADDR, INA219_REG_BUSVOLT,
-	I2C_MEMADD_SIZE_8BIT, buf, 2, 50) == HAL_OK) {
-		raw_bus = (int16_t) ((buf[0] << 8) | buf[1]);
-		*v_bus = (float) ((raw_bus >> 3) * 4) / 1000.0f;
-	} else {
+	I2C_MEMADD_SIZE_8BIT, buf, 2, 50) != HAL_OK) {
 		*v_bus = 0.0f;
+		*p_watt = 0.0f;
+		return 0;
 	}
+	raw_bus = (uint16_t) ((buf[0] << 8) | buf[1]);
+	*v_bus = (float) ((raw_bus >> 3) * 4) / 1000.0f;
 	*p_watt = (*v_bus) * (*i_ma / 1000.0f);
+
+	return 1;
 }
 /* USER CODE END 0 */
 
@@ -331,7 +339,8 @@ int main(void) {
 		if (pump_status == 1) {
 			HAL_GPIO_WritePin(IN_RELAY_GPIO_Port, IN_RELAY_Pin, RELAY_STATE_ON);
 		} else {
-			HAL_GPIO_WritePin(IN_RELAY_GPIO_Port, IN_RELAY_Pin, RELAY_STATE_OFF);
+			HAL_GPIO_WritePin(IN_RELAY_GPIO_Port, IN_RELAY_Pin,
+			RELAY_STATE_OFF);
 		}
 
 		v_bat = hitung_v_bat(adc_buffer[0]);
@@ -347,15 +356,20 @@ int main(void) {
 		}
 
 		if (ina_status == 1) {
-			INA219_Read_data(&v_pv, &i_pv, &p_pv);
+			ina_status = INA219_Read_data(&v_pv, &i_pv, &p_pv);
+			v_bat = v_pv;
+			pres_bat = hitung_pres_bat(v_bat);
 		} else {
 			ina_status = INA219_Init();
+			v_bat = 0.0f;
+			pres_bat = 0.0f;
 		}
 
 		// Evaluasi kondisi deteksi:
 		// 1. Kebakaran : Gas MQ-2 pekat (> 2000) ATAU suhu tinggi (> 50°C saat DHT22 valid)
 		// 2. Asap Rokok: Gas MQ-2 dalam rentang asap rokok (1000 - 2000 ADC) dan suhu normal
-		if (mq2_raw > MQ2_THRESHOLD_FIRE || (dht_status == 1 && suhu > SUHU_THRESHOLD_FIRE)) {
+		if (mq2_raw > MQ2_THRESHOLD_FIRE
+				|| (dht_status == 1 && suhu > SUHU_THRESHOLD_FIRE)) {
 			deteksi_kebakaran = 1;
 			deteksi_rokok = 0;
 		} else if (mq2_raw >= MQ2_THRESHOLD_ROKOK) {
@@ -377,7 +391,7 @@ int main(void) {
 		} else if (deteksi_rokok == 1) {
 			Buzzer_Beep(5, 100, 100); // 5 x 200ms = 1000 ms (1 detik bip berulang)
 			Buzzer_Off();
-			delay_sisa_ms = 1000;     // Kompensasi delay 1 detik agar total siklus tetap 2 detik
+			delay_sisa_ms = 1000; // Kompensasi delay 1 detik agar total siklus tetap 2 detik
 		} else {
 			Buzzer_Off();
 			delay_sisa_ms = 2000;
@@ -667,11 +681,11 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
 				if (strcmp(uart_rx_line, "$CMD,PUMP,1") == 0) {
 					pump_status = 1;
 					HAL_GPIO_WritePin(IN_RELAY_GPIO_Port, IN_RELAY_Pin,
-							RELAY_STATE_ON);
+					RELAY_STATE_ON);
 				} else if (strcmp(uart_rx_line, "$CMD,PUMP,0") == 0) {
 					pump_status = 0;
 					HAL_GPIO_WritePin(IN_RELAY_GPIO_Port, IN_RELAY_Pin,
-							RELAY_STATE_OFF);
+					RELAY_STATE_OFF);
 				} else if (strcmp(uart_rx_line, "$CMD,BUZZER,1") == 0) {
 					buzzer_manual = 1;
 					Buzzer_On();
