@@ -2,17 +2,7 @@
 /**
  ******************************************************************************
  * @file           : main.c
- * @brief          : Main program body
- ******************************************************************************
- * @attention
- *
- * Copyright (c) 2026 STMicroelectronics.
- * All rights reserved.
- *
- * This software is licensed under terms that can be found in the LICENSE file
- * in the root directory of this software component.
- * If no LICENSE file comes with this software, it is provided AS-IS.
- *
+ * @brief          : Main program body (Dual INA219 I2C1/I2C2 + ADC1_IN1 Only)
  ******************************************************************************
  */
 /* USER CODE END Header */
@@ -32,7 +22,7 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-// Konfigurasi Buzzer Active-LOW (Sesuai implementasi cek-buzz: ON = RESET / 0V, OFF = SET / 3.3V)
+// Konfigurasi Buzzer Active-LOW (ON = RESET / 0V, OFF = SET / 3.3V)
 #define BUZZER_STATE_ON       GPIO_PIN_RESET
 #define BUZZER_STATE_OFF      GPIO_PIN_SET
 
@@ -41,9 +31,19 @@
 #define RELAY_STATE_OFF       GPIO_PIN_SET
 
 // Parameter Ambang Batas Sensor (Thresholds)
-#define MQ2_THRESHOLD_ROKOK   700      // Nilai batas asap rokok (1000 - 2000 ADC)
-#define MQ2_THRESHOLD_FIRE    1500      // Nilai batas kebakaran gas/asap pekat (> 2000 ADC)
-#define SUHU_THRESHOLD_FIRE   50.0f     // Nilai batas suhu kebakaran (> 50.0 °C)
+#define MQ2_THRESHOLD_ROKOK   700      // Batas asap rokok (1000 - 2000 ADC)
+#define MQ2_THRESHOLD_FIRE    1500      // Batas kebakaran gas/asap pekat (> 2000 ADC)
+#define SUHU_THRESHOLD_FIRE   50.0f     // Batas suhu kebakaran (> 50.0 C)
+
+// Konfigurasi Alamat & Register INA219 (kedua sensor pakai 0x40 di bus I2C berbeda)
+#define INA219_ADDR           (0x40 << 1)
+#define INA219_REG_CONFIG     0x00
+#define INA219_REG_SHUNTVOLT  0x01
+#define INA219_REG_BUSVOLT    0x02
+
+// Batas Tegangan Baterai 3S (11.1V kosong, 12.6V penuh)
+#define VBAT_MIN              11.1f
+#define VBAT_MAX              12.6f
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -56,27 +56,44 @@ ADC_HandleTypeDef hadc1;
 DMA_HandleTypeDef hdma_adc1;
 
 I2C_HandleTypeDef hi2c1;
+I2C_HandleTypeDef hi2c2;
 
 TIM_HandleTypeDef htim2;
 
 UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
-uint16_t adc_buffer[2];
+// Hanya 1 channel ADC (PA1 / ADC1_IN1 untuk MQ-2)
+uint16_t adc_buffer[1];
 
+// Data Baterai -> Rangkaian (INA219 #1 di I2C1: PB6/PB7)
 float v_bat = 0.0f;
 float pres_bat = 0.0f;
+float i_bat = 0.0f;          // Arus beban ke rangkaian (bisa dipantau di Live Expressions)
+float p_bat = 0.0f;          // Daya beban ke rangkaian (bisa dipantau di Live Expressions)
+uint8_t ina_bat_status = 0;
+
+// Data Solar Panel -> SCC/Baterai (INA219 #2 di I2C2: PB10/PB11)
 float v_pv = 0.0f;
 float i_pv = 0.0f;
 float p_pv = 0.0f;
+uint8_t ina_pv_status = 0;
+
+// Status gabungan INA untuk format JSON ESP32 (1 jika kedua INA terhubung)
 uint8_t ina_status = 0;
 
+// Moving average tegangan baterai (5 sampel) agar persentase stabil
+float v_bat_hist[5] = { 0.0f };
+uint8_t v_bat_idx = 0;
+uint8_t v_bat_count = 0;
+
+// Data Lingkungan & Gas
 uint16_t mq2_raw = 0;
 float suhu = 0.0f;
 float kelembapan = 0.0f;
 uint8_t dht_status = 0;
 
-// Variabel status & kontrol (volatile agar dapat dimonitor/diedit langsung via Live Expressions)
+// Variabel status & kontrol (volatile untuk Live Expressions & Interrupt)
 volatile uint8_t pump_status = 0;
 volatile uint8_t buzzer_manual = 0;
 volatile uint8_t deteksi_kebakaran = 0;
@@ -93,22 +110,22 @@ static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_I2C1_Init(void);
+static void MX_I2C2_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_TIM2_Init(void);
 /* USER CODE BEGIN PFP */
 void Buzzer_On(void);
 void Buzzer_Off(void);
 void Buzzer_Beep(uint8_t jumlah, uint16_t on_ms, uint16_t off_ms);
+float hitung_pres_bat(float volt);
+float filter_v_bat(float v_baru);
+uint8_t INA219_Init(I2C_HandleTypeDef *hi2c);
+uint8_t INA219_Read_Data(I2C_HandleTypeDef *hi2c, float *v_bus, float *i_ma, float *p_watt);
+void I2C_Bus_Recovery(I2C_HandleTypeDef *hi2c);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-//#define DIVIDER_RATIO 5.54545f
-#define INA219_ADDR				(0x40 << 1)
-#define INA219_REG_CONFIG   	0x00
-#define INA219_REG_SHUNTVOLT 	0x01
-#define INA219_REG_BUSVOLT  	0x02
-
 void Buzzer_On(void) {
 	HAL_GPIO_WritePin(BUZZER_GPIO_Port, BUZZER_Pin, BUZZER_STATE_ON);
 }
@@ -126,23 +143,33 @@ void Buzzer_Beep(uint8_t jumlah, uint16_t on_ms, uint16_t off_ms) {
 	}
 }
 
-float hitung_v_bat(uint16_t raw_adc) {
-	float v_pin = ((float) raw_adc / 4095.0f) * 3.3f;
-	return v_pin;
-//	return v_pin * DIVIDER_RATIO;
-}
 float hitung_pres_bat(float volt) {
-	if (volt >= 12.6f)
+	if (volt >= VBAT_MAX)
 		return 100.0f;
-	if (volt <= 11.1f)
+	if (volt <= VBAT_MIN)
 		return 0.0f;
-	return ((volt - 11.1f) / (12.6f - 11.1f)) * 100.0f;
+	return ((volt - VBAT_MIN) / (VBAT_MAX - VBAT_MIN)) * 100.0f;
 }
+
+float filter_v_bat(float v_baru) {
+	v_bat_hist[v_bat_idx] = v_baru;
+	v_bat_idx = (v_bat_idx + 1) % 5;
+	if (v_bat_count < 5) {
+		v_bat_count++;
+	}
+	float total = 0.0f;
+	for (uint8_t i = 0; i < v_bat_count; i++) {
+		total += v_bat_hist[i];
+	}
+	return total / (float) v_bat_count;
+}
+
 void delay_us(uint16_t us) {
 	uint16_t start = (uint16_t) htim2.Instance->CNT;
 	while ((uint16_t) (htim2.Instance->CNT - start) < us)
 		;
 }
+
 static void DHT_SetPin_Output(void) {
 	GPIO_InitTypeDef GPIO_InitStruct = { 0 };
 	GPIO_InitStruct.Pin = DHT22_Pin;
@@ -150,6 +177,7 @@ static void DHT_SetPin_Output(void) {
 	GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
 	HAL_GPIO_Init(DHT22_GPIO_Port, &GPIO_InitStruct);
 }
+
 static void DHT_SetPin_Input(void) {
 	GPIO_InitTypeDef GPIO_InitStruct = { 0 };
 	GPIO_InitStruct.Pin = DHT22_Pin;
@@ -157,15 +185,7 @@ static void DHT_SetPin_Input(void) {
 	GPIO_InitStruct.Pull = GPIO_PULLUP;
 	HAL_GPIO_Init(DHT22_GPIO_Port, &GPIO_InitStruct);
 }
-//static void DHT_Init_OpenDrain(void) {
-//	GPIO_InitTypeDef GPIO_InitStruct = { 0 };
-//	GPIO_InitStruct.Pin = DHT_PIN;
-//	GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
-//	GPIO_InitStruct.Pull = GPIO_PULLUP;
-//	GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
-//	HAL_GPIO_Init(DHT_PORT, &GPIO_InitStruct);
-//	HAL_GPIO_WritePin(DHT_PORT, DHT_PIN, GPIO_PIN_SET);
-//}
+
 uint8_t DHT22_Read_Data(float *suhu_out, float *kelembapan_out) {
 	uint8_t bits[5] = { 0, 0, 0, 0, 0 };
 	uint16_t t0;
@@ -239,39 +259,120 @@ uint8_t DHT22_Read_Data(float *suhu_out, float *kelembapan_out) {
 	}
 	return 1;
 }
-uint8_t INA219_Init(void) {
-	if (HAL_I2C_IsDeviceReady(&hi2c1, INA219_ADDR, 2, 50) != HAL_OK) {
-		return 0;
+
+// Fungsi Auto Recovery Bus I2C untuk mengatasi HAL_BUSY / HAL_ERROR (Errata I2C STM32F1)
+void I2C_Bus_Recovery(I2C_HandleTypeDef *hi2c) {
+	GPIO_TypeDef *port = GPIOB;
+	uint16_t scl_pin, sda_pin;
+
+	if (hi2c->Instance == I2C1) {
+		scl_pin = GPIO_PIN_6;
+		sda_pin = GPIO_PIN_7;
+	} else if (hi2c->Instance == I2C2) {
+		scl_pin = GPIO_PIN_10;
+		sda_pin = GPIO_PIN_11;
+	} else {
+		return;
 	}
-	uint8_t config[3] = { INA219_REG_CONFIG, 0x39, 0x9F };
-	if (HAL_I2C_Master_Transmit(&hi2c1, INA219_ADDR, config, 3, 50) == HAL_OK) {
+
+	// 1. De-inisialisasi peripheral I2C (disable peripheral & clock)
+	HAL_I2C_DeInit(hi2c);
+
+	// 2. Konfigurasi SCL dan SDA menjadi GPIO Output Open-Drain dengan pull-up
+	GPIO_InitTypeDef GPIO_InitStruct = { 0 };
+	GPIO_InitStruct.Pin = scl_pin | sda_pin;
+	GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
+	GPIO_InitStruct.Pull = GPIO_PULLUP;
+	GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+	HAL_GPIO_Init(port, &GPIO_InitStruct);
+
+	// Set kedua pin ke HIGH awal
+	HAL_GPIO_WritePin(port, sda_pin, GPIO_PIN_SET);
+	HAL_GPIO_WritePin(port, scl_pin, GPIO_PIN_SET);
+	delay_us(10);
+
+	// 3. Clock Toggling (9 pulsa clock) agar slave melepaskan SDA yang tersangkut di LOW
+	for (uint8_t i = 0; i < 9; i++) {
+		HAL_GPIO_WritePin(port, scl_pin, GPIO_PIN_RESET);
+		delay_us(10);
+		HAL_GPIO_WritePin(port, scl_pin, GPIO_PIN_SET);
+		delay_us(10);
+	}
+
+	// 4. Generate STOP Condition manual: SDA LOW saat SCL HIGH, lalu SDA HIGH
+	HAL_GPIO_WritePin(port, sda_pin, GPIO_PIN_RESET);
+	delay_us(10);
+	HAL_GPIO_WritePin(port, scl_pin, GPIO_PIN_SET);
+	delay_us(10);
+	HAL_GPIO_WritePin(port, sda_pin, GPIO_PIN_SET);
+	delay_us(10);
+
+	// 5. Reset controller I2C di tingkat RCC hardware
+	if (hi2c->Instance == I2C1) {
+		__HAL_RCC_I2C1_FORCE_RESET();
+		delay_us(10);
+		__HAL_RCC_I2C1_RELEASE_RESET();
+	} else if (hi2c->Instance == I2C2) {
+		__HAL_RCC_I2C2_FORCE_RESET();
+		delay_us(10);
+		__HAL_RCC_I2C2_RELEASE_RESET();
+	}
+
+	// 6. Inisialisasi ulang peripheral I2C (HAL_I2C_Init otomatis memanggil MSP Init untuk pin AF_OD)
+	HAL_I2C_Init(hi2c);
+}
+
+// Fungsi reusable INA219 untuk hi2c1 (Baterai) maupun hi2c2 (Solar Panel)
+uint8_t INA219_Init(I2C_HandleTypeDef *hi2c) {
+	// Jika bus sedang BUSY atau device tidak merespon, jalankan recovery terlebih dahulu
+	if (HAL_I2C_IsDeviceReady(hi2c, INA219_ADDR, 2, 50) != HAL_OK) {
+		I2C_Bus_Recovery(hi2c);
+		if (HAL_I2C_IsDeviceReady(hi2c, INA219_ADDR, 2, 50) != HAL_OK) {
+			return 0;
+		}
+	}
+	// 0x3FFF: 32V Bus Range, +-320mV Shunt, 128-sample hardware averaging, continuous
+	uint8_t config[3] = { INA219_REG_CONFIG, 0x3F, 0xFF };
+	if (HAL_I2C_Master_Transmit(hi2c, INA219_ADDR, config, 3, 50) == HAL_OK) {
 		return 1;
 	}
+	I2C_Bus_Recovery(hi2c);
 	return 0;
 }
-// Ubah return type menjadi uint8_t agar status koneksi I2C terpantau real-time
-uint8_t INA219_Read_data(float *v_bus, float *i_ma, float *p_watt) {
+
+uint8_t INA219_Read_Data(I2C_HandleTypeDef *hi2c, float *v_bus, float *i_ma, float *p_watt) {
 	uint8_t buf[2];
 	int16_t raw_shunt = 0;
-	uint16_t raw_bus = 0;
+	uint16_t raw_bus = 0; // Wajib unsigned agar aman membaca panel surya > 16.38V
+	HAL_StatusTypeDef status;
 
-	if (HAL_I2C_Mem_Read(&hi2c1, INA219_ADDR, INA219_REG_SHUNTVOLT,
-	I2C_MEMADD_SIZE_8BIT, buf, 2, 50) != HAL_OK) {
+	status = HAL_I2C_Mem_Read(hi2c, INA219_ADDR, INA219_REG_SHUNTVOLT,
+			I2C_MEMADD_SIZE_8BIT, buf, 2, 50);
+	if (status != HAL_OK) {
 		*i_ma = 0.0f;
 		*v_bus = 0.0f;
 		*p_watt = 0.0f;
+		if (status == HAL_BUSY || status == HAL_ERROR) {
+			I2C_Bus_Recovery(hi2c);
+		}
 		return 0;
 	}
 	raw_shunt = (int16_t) ((buf[0] << 8) | buf[1]);
 	*i_ma = (float) raw_shunt * 0.1f;
-	if (*i_ma < 0.0f) {
+
+	// Potong arus negatif dan zero-offset noise < 3 mA agar terbaca bersih 0.0 saat idle
+	if (*i_ma < 3.0f) {
 		*i_ma = 0.0f;
 	}
 
-	if (HAL_I2C_Mem_Read(&hi2c1, INA219_ADDR, INA219_REG_BUSVOLT,
-	I2C_MEMADD_SIZE_8BIT, buf, 2, 50) != HAL_OK) {
+	status = HAL_I2C_Mem_Read(hi2c, INA219_ADDR, INA219_REG_BUSVOLT,
+			I2C_MEMADD_SIZE_8BIT, buf, 2, 50);
+	if (status != HAL_OK) {
 		*v_bus = 0.0f;
 		*p_watt = 0.0f;
+		if (status == HAL_BUSY || status == HAL_ERROR) {
+			I2C_Bus_Recovery(hi2c);
+		}
 		return 0;
 	}
 	raw_bus = (uint16_t) ((buf[0] << 8) | buf[1]);
@@ -292,16 +393,7 @@ int main(void) {
 
 	/* USER CODE END 1 */
 
-	/* MCU Configuration--------------------------------------------------------*/
-
-	/* Reset of all peripherals, Initializes the Flash interface and the Systick. */
 	HAL_Init();
-
-	/* USER CODE BEGIN Init */
-
-	/* USER CODE END Init */
-
-	/* Configure the system clock */
 	SystemClock_Config();
 
 	/* USER CODE BEGIN SysInit */
@@ -313,20 +405,26 @@ int main(void) {
 	MX_DMA_Init();
 	MX_ADC1_Init();
 	MX_I2C1_Init();
+	MX_I2C2_Init();
 	MX_USART1_UART_Init();
 	MX_TIM2_Init();
+
 	/* USER CODE BEGIN 2 */
 	HAL_GPIO_WritePin(IN_RELAY_GPIO_Port, IN_RELAY_Pin, RELAY_STATE_OFF);
-	// Inisialisasi buzzer dalam keadaan MATI (Active-LOW: SET = OFF)
 	Buzzer_Off();
-	// Indikasi sistem startup siap (beep 1x pendek 100ms)
 	Buzzer_Beep(1, 100, 100);
 
 	__HAL_TIM_SET_PRESCALER(&htim2, 71);
 	htim2.Instance->EGR = TIM_EGR_UG;
 	HAL_TIM_Base_Start(&htim2);
-	HAL_ADC_Start_DMA(&hadc1, (uint32_t*) adc_buffer, 2);
-	ina_status = INA219_Init();
+
+	// Jalankan ADC DMA untuk 1 channel saja (PA1 / MQ-2)
+	HAL_ADC_Start_DMA(&hadc1, (uint32_t*) adc_buffer, 1);
+
+	// Inisialisasi kedua sensor INA219
+	ina_bat_status = INA219_Init(&hi2c1); // Baterai -> Rangkaian
+	ina_pv_status  = INA219_Init(&hi2c2); // Solar Panel -> SCC/Baterai
+
 	HAL_UART_Receive_IT(&huart1, &uart_rx_byte, 1);
 	HAL_Delay(2000);
 	/* USER CODE END 2 */
@@ -334,40 +432,53 @@ int main(void) {
 	/* Infinite loop */
 	/* USER CODE BEGIN WHILE */
 	while (1) {
-		// 0. Sinkronisasi status Relay Pompa ke pin hardware (Active-LOW: RESET = ON, SET = OFF)
-		// Memungkinkan pengujian relay langsung lewat Live Expressions di STM32CubeIDE (variabel: pump_status)
+		// 0. Sinkronisasi status Relay Pompa (Active-LOW)
 		if (pump_status == 1) {
 			HAL_GPIO_WritePin(IN_RELAY_GPIO_Port, IN_RELAY_Pin, RELAY_STATE_ON);
 		} else {
-			HAL_GPIO_WritePin(IN_RELAY_GPIO_Port, IN_RELAY_Pin,
-			RELAY_STATE_OFF);
+			HAL_GPIO_WritePin(IN_RELAY_GPIO_Port, IN_RELAY_Pin, RELAY_STATE_OFF);
 		}
 
-		v_bat = hitung_v_bat(adc_buffer[0]);
-		pres_bat = hitung_pres_bat(v_bat);
-		mq2_raw = adc_buffer[1];
+		// 1. Baca MQ-2 dari ADC1_IN1 (sekarang berada di indeks 0)
+		mq2_raw = adc_buffer[0];
 
+		// 2. Baca Sensor INA219 #1 di I2C1 (Baterai -> Rangkaian)
+		if (ina_bat_status == 1) {
+			float v_bat_raw = 0.0f;
+			ina_bat_status = INA219_Read_Data(&hi2c1, &v_bat_raw, &i_bat, &p_bat);
+			if (ina_bat_status == 1) {
+				v_bat = filter_v_bat(v_bat_raw);
+				pres_bat = hitung_pres_bat(v_bat);
+			}
+		} else {
+			ina_bat_status = INA219_Init(&hi2c1);
+			v_bat = 0.0f;
+			pres_bat = 0.0f;
+			i_bat = 0.0f;
+			p_bat = 0.0f;
+		}
+
+		// 3. Baca Sensor INA219 #2 di I2C2 (Solar Panel -> SCC/Baterai)
+		if (ina_pv_status == 1) {
+			ina_pv_status = INA219_Read_Data(&hi2c2, &v_pv, &i_pv, &p_pv);
+		} else {
+			ina_pv_status = INA219_Init(&hi2c2);
+			v_pv = 0.0f;
+			i_pv = 0.0f;
+			p_pv = 0.0f;
+		}
+
+		// Status INA untuk dikirim ke ESP32/Android (1 jika kedua sensor aktif)
+		ina_status = (ina_bat_status == 1 && ina_pv_status == 1) ? 1 : 0;
+
+		// 4. Baca Sensor Suhu & Kelembapan DHT22
 		dht_status = DHT22_Read_Data(&suhu, &kelembapan);
-
-		// Proteksi: jika data DHT22 gagal dibaca, reset suhu & kelembapan ke 0 agar tidak memicu alarm palsu
 		if (dht_status != 1) {
 			suhu = 0.0f;
 			kelembapan = 0.0f;
 		}
 
-		if (ina_status == 1) {
-			ina_status = INA219_Read_data(&v_pv, &i_pv, &p_pv);
-			v_bat = v_pv;
-			pres_bat = hitung_pres_bat(v_bat);
-		} else {
-			ina_status = INA219_Init();
-			v_bat = 0.0f;
-			pres_bat = 0.0f;
-		}
-
-		// Evaluasi kondisi deteksi:
-		// 1. Kebakaran : Gas MQ-2 pekat (> 2000) ATAU suhu tinggi (> 50°C saat DHT22 valid)
-		// 2. Asap Rokok: Gas MQ-2 dalam rentang asap rokok (1000 - 2000 ADC) dan suhu normal
+		// 5. Evaluasi Deteksi Kebakaran & Asap Rokok
 		if (mq2_raw > MQ2_THRESHOLD_FIRE
 				|| (dht_status == 1 && suhu > SUHU_THRESHOLD_FIRE)) {
 			deteksi_kebakaran = 1;
@@ -380,29 +491,26 @@ int main(void) {
 			deteksi_rokok = 0;
 		}
 
-		// Pola kendali Buzzer (Active-LOW: ON = RESET, OFF = SET):
-		// - Kebakaran / Manual: Buzzer MENYALA TERUS hingga aman
-		// - Asap Rokok        : Buzzer BIP BERULANG SELAMA 1 DETIK (5x beep @ 100ms ON / 100ms OFF)
-		// - Aman              : Buzzer MATI
+		// 6. Kendali Buzzer (Active-LOW)
 		uint16_t delay_sisa_ms = 2000;
 		if (buzzer_manual == 1 || deteksi_kebakaran == 1) {
 			Buzzer_On();
-			delay_sisa_ms = 2000; // Buzzer tetap menyala terus selama delay dan iterasi berikutnya
+			delay_sisa_ms = 2000;
 		} else if (deteksi_rokok == 1) {
-			Buzzer_Beep(5, 100, 100); // 5 x 200ms = 1000 ms (1 detik bip berulang)
+			Buzzer_Beep(5, 100, 100);
 			Buzzer_Off();
-			delay_sisa_ms = 1000; // Kompensasi delay 1 detik agar total siklus tetap 2 detik
+			delay_sisa_ms = 1000;
 		} else {
 			Buzzer_Off();
 			delay_sisa_ms = 2000;
 		}
 
-		// Format pesan serial UART ke ESP32 (TIDAK BERUBAH / TETAP PERSIS)
+		// 7. Kirim Paket Serial ke ESP32 (Format tetap sama persis 11 field)
 		char uart_tx_buff[140];
 		int len = sprintf(uart_tx_buff,
-				"$DATA,%.2f,%.1f,%u,%.1f,%.1f,%u,%.2f,%.1f,%.2f,%u,%u\n", v_bat,
-				pres_bat, mq2_raw, suhu, kelembapan, dht_status, v_pv, i_pv,
-				p_pv, ina_status, pump_status);
+				"$DATA,%.2f,%.1f,%u,%.1f,%.1f,%u,%.2f,%.1f,%.2f,%u,%u\n",
+				v_bat, pres_bat, mq2_raw, suhu, kelembapan, dht_status,
+				v_pv, i_pv, p_pv, ina_status, pump_status);
 
 		HAL_UART_Transmit(&huart1, (uint8_t*) uart_tx_buff, len, 100);
 
@@ -414,18 +522,11 @@ int main(void) {
 	/* USER CODE END 3 */
 }
 
-/**
- * @brief System Clock Configuration
- * @retval None
- */
 void SystemClock_Config(void) {
 	RCC_OscInitTypeDef RCC_OscInitStruct = { 0 };
 	RCC_ClkInitTypeDef RCC_ClkInitStruct = { 0 };
 	RCC_PeriphCLKInitTypeDef PeriphClkInit = { 0 };
 
-	/** Initializes the RCC Oscillators according to the specified parameters
-	 * in the RCC_OscInitTypeDef structure.
-	 */
 	RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
 	RCC_OscInitStruct.HSEState = RCC_HSE_ON;
 	RCC_OscInitStruct.HSEPredivValue = RCC_HSE_PREDIV_DIV1;
@@ -437,8 +538,6 @@ void SystemClock_Config(void) {
 		Error_Handler();
 	}
 
-	/** Initializes the CPU, AHB and APB buses clocks
-	 */
 	RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK
 			| RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
 	RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
@@ -456,73 +555,30 @@ void SystemClock_Config(void) {
 	}
 }
 
-/**
- * @brief ADC1 Initialization Function
- * @param None
- * @retval None
- */
 static void MX_ADC1_Init(void) {
-
-	/* USER CODE BEGIN ADC1_Init 0 */
-
-	/* USER CODE END ADC1_Init 0 */
-
 	ADC_ChannelConfTypeDef sConfig = { 0 };
 
-	/* USER CODE BEGIN ADC1_Init 1 */
-
-	/* USER CODE END ADC1_Init 1 */
-
-	/** Common config
-	 */
 	hadc1.Instance = ADC1;
-	hadc1.Init.ScanConvMode = ADC_SCAN_ENABLE;
+	hadc1.Init.ScanConvMode = ADC_SCAN_DISABLE;
 	hadc1.Init.ContinuousConvMode = ENABLE;
 	hadc1.Init.DiscontinuousConvMode = DISABLE;
 	hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
 	hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
-	hadc1.Init.NbrOfConversion = 2;
+	hadc1.Init.NbrOfConversion = 1;
 	if (HAL_ADC_Init(&hadc1) != HAL_OK) {
 		Error_Handler();
 	}
 
-	/** Configure Regular Channel
-	 */
-	sConfig.Channel = ADC_CHANNEL_0;
-	sConfig.Rank = ADC_REGULAR_RANK_1;
-	sConfig.SamplingTime = ADC_SAMPLETIME_239CYCLES_5;
-	if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK) {
-		Error_Handler();
-	}
-
-	/** Configure Regular Channel
-	 */
+	// Hanya PA1 (ADC_CHANNEL_1) untuk sensor MQ-2
 	sConfig.Channel = ADC_CHANNEL_1;
-	sConfig.Rank = ADC_REGULAR_RANK_2;
+	sConfig.Rank = ADC_REGULAR_RANK_1;
 	sConfig.SamplingTime = ADC_SAMPLETIME_55CYCLES_5;
 	if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK) {
 		Error_Handler();
 	}
-	/* USER CODE BEGIN ADC1_Init 2 */
-
-	/* USER CODE END ADC1_Init 2 */
-
 }
 
-/**
- * @brief I2C1 Initialization Function
- * @param None
- * @retval None
- */
 static void MX_I2C1_Init(void) {
-
-	/* USER CODE BEGIN I2C1_Init 0 */
-
-	/* USER CODE END I2C1_Init 0 */
-
-	/* USER CODE BEGIN I2C1_Init 1 */
-
-	/* USER CODE END I2C1_Init 1 */
 	hi2c1.Instance = I2C1;
 	hi2c1.Init.ClockSpeed = 100000;
 	hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
@@ -535,29 +591,27 @@ static void MX_I2C1_Init(void) {
 	if (HAL_I2C_Init(&hi2c1) != HAL_OK) {
 		Error_Handler();
 	}
-	/* USER CODE BEGIN I2C1_Init 2 */
-
-	/* USER CODE END I2C1_Init 2 */
-
 }
 
-/**
- * @brief TIM2 Initialization Function
- * @param None
- * @retval None
- */
+static void MX_I2C2_Init(void) {
+	hi2c2.Instance = I2C2;
+	hi2c2.Init.ClockSpeed = 100000;
+	hi2c2.Init.DutyCycle = I2C_DUTYCYCLE_2;
+	hi2c2.Init.OwnAddress1 = 0;
+	hi2c2.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+	hi2c2.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+	hi2c2.Init.OwnAddress2 = 0;
+	hi2c2.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+	hi2c2.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+	if (HAL_I2C_Init(&hi2c2) != HAL_OK) {
+		Error_Handler();
+	}
+}
+
 static void MX_TIM2_Init(void) {
-
-	/* USER CODE BEGIN TIM2_Init 0 */
-
-	/* USER CODE END TIM2_Init 0 */
-
 	TIM_ClockConfigTypeDef sClockSourceConfig = { 0 };
 	TIM_MasterConfigTypeDef sMasterConfig = { 0 };
 
-	/* USER CODE BEGIN TIM2_Init 1 */
-
-	/* USER CODE END TIM2_Init 1 */
 	htim2.Instance = TIM2;
 	htim2.Init.Prescaler = 72 - 1;
 	htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
@@ -573,30 +627,12 @@ static void MX_TIM2_Init(void) {
 	}
 	sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
 	sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-	if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig)
-			!= HAL_OK) {
+	if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK) {
 		Error_Handler();
 	}
-	/* USER CODE BEGIN TIM2_Init 2 */
-
-	/* USER CODE END TIM2_Init 2 */
-
 }
 
-/**
- * @brief USART1 Initialization Function
- * @param None
- * @retval None
- */
 static void MX_USART1_UART_Init(void) {
-
-	/* USER CODE BEGIN USART1_Init 0 */
-
-	/* USER CODE END USART1_Init 0 */
-
-	/* USER CODE BEGIN USART1_Init 1 */
-
-	/* USER CODE END USART1_Init 1 */
 	huart1.Instance = USART1;
 	huart1.Init.BaudRate = 115200;
 	huart1.Init.WordLength = UART_WORDLENGTH_8B;
@@ -608,67 +644,35 @@ static void MX_USART1_UART_Init(void) {
 	if (HAL_UART_Init(&huart1) != HAL_OK) {
 		Error_Handler();
 	}
-	/* USER CODE BEGIN USART1_Init 2 */
-
-	/* USER CODE END USART1_Init 2 */
-
 }
 
-/**
- * Enable DMA controller clock
- */
 static void MX_DMA_Init(void) {
-
-	/* DMA controller clock enable */
 	__HAL_RCC_DMA1_CLK_ENABLE();
-
-	/* DMA interrupt init */
-	/* DMA1_Channel1_IRQn interrupt configuration */
 	HAL_NVIC_SetPriority(DMA1_Channel1_IRQn, 0, 0);
 	HAL_NVIC_EnableIRQ(DMA1_Channel1_IRQn);
-
 }
 
-/**
- * @brief GPIO Initialization Function
- * @param None
- * @retval None
- */
 static void MX_GPIO_Init(void) {
 	GPIO_InitTypeDef GPIO_InitStruct = { 0 };
-	/* USER CODE BEGIN MX_GPIO_Init_1 */
 
-	/* USER CODE END MX_GPIO_Init_1 */
-
-	/* GPIO Ports Clock Enable */
 	__HAL_RCC_GPIOD_CLK_ENABLE();
 	__HAL_RCC_GPIOA_CLK_ENABLE();
 	__HAL_RCC_GPIOB_CLK_ENABLE();
 
-	/*Configure GPIO pin Output Level */
-	HAL_GPIO_WritePin(BUZZER_GPIO_Port, BUZZER_Pin, GPIO_PIN_RESET);
-
-	/*Configure GPIO pin Output Level */
+	HAL_GPIO_WritePin(BUZZER_GPIO_Port, BUZZER_Pin, BUZZER_STATE_OFF);
 	HAL_GPIO_WritePin(GPIOB, DHT22_Pin | IN_RELAY_Pin, GPIO_PIN_SET);
 
-	/*Configure GPIO pins : BUZZER_Pin IN_RELAY_Pin */
 	GPIO_InitStruct.Pin = BUZZER_Pin | IN_RELAY_Pin;
 	GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
 	GPIO_InitStruct.Pull = GPIO_NOPULL;
 	GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
 	HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
-	/*Configure GPIO pin : DHT22_Pin */
 	GPIO_InitStruct.Pin = DHT22_Pin;
 	GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
 	GPIO_InitStruct.Pull = GPIO_PULLUP;
 	GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
 	HAL_GPIO_Init(DHT22_GPIO_Port, &GPIO_InitStruct);
-
-	/* USER CODE BEGIN MX_GPIO_Init_2 */
-	// Memastikan pin buzzer dalam kondisi MATI (SET / 3.3V) segera setelah GPIO diinisialisasi
-	HAL_GPIO_WritePin(BUZZER_GPIO_Port, BUZZER_Pin, BUZZER_STATE_OFF);
-	/* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
@@ -680,12 +684,10 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
 
 				if (strcmp(uart_rx_line, "$CMD,PUMP,1") == 0) {
 					pump_status = 1;
-					HAL_GPIO_WritePin(IN_RELAY_GPIO_Port, IN_RELAY_Pin,
-					RELAY_STATE_ON);
+					HAL_GPIO_WritePin(IN_RELAY_GPIO_Port, IN_RELAY_Pin, RELAY_STATE_ON);
 				} else if (strcmp(uart_rx_line, "$CMD,PUMP,0") == 0) {
 					pump_status = 0;
-					HAL_GPIO_WritePin(IN_RELAY_GPIO_Port, IN_RELAY_Pin,
-					RELAY_STATE_OFF);
+					HAL_GPIO_WritePin(IN_RELAY_GPIO_Port, IN_RELAY_Pin, RELAY_STATE_OFF);
 				} else if (strcmp(uart_rx_line, "$CMD,BUZZER,1") == 0) {
 					buzzer_manual = 1;
 					Buzzer_On();
@@ -703,31 +705,10 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
 }
 /* USER CODE END 4 */
 
-/**
- * @brief  This function is executed in case of error occurrence.
- * @retval None
- */
 void Error_Handler(void) {
 	/* USER CODE BEGIN Error_Handler_Debug */
-	/* User can add his own implementation to report the HAL error return state */
 	__disable_irq();
 	while (1) {
 	}
 	/* USER CODE END Error_Handler_Debug */
 }
-#ifdef USE_FULL_ASSERT
-/**
-  * @brief  Reports the name of the source file and the source line number
-  *         where the assert_param error has occurred.
-  * @param  file: pointer to the source file name
-  * @param  line: assert_param error line source number
-  * @retval None
-  */
-void assert_failed(uint8_t *file, uint32_t line)
-{
-  /* USER CODE BEGIN 6 */
-  /* User can add his own implementation to report the file name and line number,
-     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
-  /* USER CODE END 6 */
-}
-#endif /* USE_FULL_ASSERT */

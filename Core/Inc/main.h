@@ -57,8 +57,6 @@ void Error_Handler(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
-#define V_DIVIDER_Pin GPIO_PIN_0
-#define V_DIVIDER_GPIO_Port GPIOA
 #define MQ2_Pin GPIO_PIN_1
 #define MQ2_GPIO_Port GPIOA
 #define BUZZER_Pin GPIO_PIN_0
